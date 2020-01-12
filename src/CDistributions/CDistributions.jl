@@ -7,13 +7,13 @@ Particle mass distribution functions for microphysical process modeling:
   - creating distributions given a set of parameters
   - creating distributions given a set of moments
 """
-module Distributions
+module CDistributions
 
 using SpecialFunctions: gamma, gamma_inc
 using DocStringExtensions
 
 import LinearAlgebra: norm
-import Optim: optimize, LBFGS
+import Optim: optimize, LBFGS, LineSearches
 
 # mass distributions available for microphysics
 export Distribution
@@ -337,7 +337,7 @@ function update_params_from_moments(dist::Distribution{FT}, m::Array{FT}) where 
   r = optimize(
     g,
     log.(reduce(vcat, get_params(dist)[2])) .+ 1e-6, # initial value for new dist parameters is old dist parameters
-    LBFGS(),
+    LBFGS(linesearch=LineSearches.BackTracking()),
     autodiff = :forward
   );
 

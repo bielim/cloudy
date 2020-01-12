@@ -20,13 +20,19 @@ Exports: MCMCObj
          sample_posterior!
 -------------------------------------
 """
+# import Cloudy modules
+include("/home/melanie/cloudy/src/PerfectModel/EKI.jl")
+include("/home/melanie/cloudy/src/PerfectModel/Truth.jl")
+include("/home/melanie/cloudy/src/PerfectModel/GPEmulator.jl")
+using .GPEmulator
 
-#packages
+# packages
 using Statistics 
 using Distributions
 using LinearAlgebra
 
-#exports
+
+# exports
 export MCMCObj
 export mcmc_sample! 
 export accept_ratio 
@@ -78,7 +84,7 @@ function MCMCObj(truth_sample::Vector{Float64}, truth_cov::Array{Float64, 2},
         println("only random walk metropolis 'rwm' is implemented so far")
         sys.exit()
     end
-    MCMCObj(truth_sample, truth_cov, truth_covinv, prior, [step], burnin, 
+    MCMCObj(truth_sample, truth_cov, truth_covinv, priors, [step], burnin, 
             param, posterior, log_posterior, iter, accept, algtype)
 
 end
@@ -155,7 +161,7 @@ function log_prior(mcmc::MCMCObj)
     # a distribution which is potentially a mixture of distributions. 
     priors = mcmc.prior[1] 
     for (param, prior_dist) in zip(mcmc.param, priors)
-        if !(typeof(prior_i) == Deterministic{Float64})
+        if !(typeof(prior_dist) == Deterministic{Float64})
             log_rho[1] += logpdf(prior_dist, param) # get distrubtion at current parameter values
         else
             if param == Deterministic.val
@@ -178,12 +184,24 @@ function proposal(mcmc::MCMCObj)
     priors = mcmc.prior[1]
     for (idx, prior) in enumerate(priors)
         var[idx] = var(prior)
+        if typeof(prior) == Uniform{Float64}
+            unidx[idx] = 1
+        end
     end
+
     if mcmc.algtype == "rwm"
         prop_dist = MvNormal(mcmc.posterior[1 + mcmc.iter[1],:], (mcmc.step[1]^2) * Diagonal(var))
     end
     sample = rand(prop_dist)
 
+    for (idx, prior) in enumerate(mcmc.prior)
+        if unidx[idx] > 0
+            while sample[idx] < prior.a || sample[idx] > prior.b
+                sample[:] = rand(prop_dist)
+            end
+        end
+    end
+            
     return sample
 end
 

@@ -1,4 +1,5 @@
 module EKI
+
 """
 Module: EKI
 -------------------------------------
@@ -24,7 +25,10 @@ using Cloudy.Sources
 using Cloudy.KernelTensors
 
 # packages
+using Random
+#using ODEInterface
 using Statistics 
+using Sundials
 using Plots
 using Distributions
 using LinearAlgebra
@@ -65,7 +69,7 @@ end
 
 # outer constructors
 function EKIObj(parameters::Array{Float64, 2}, parameter_names::Vector{String},
-                t_mean::Vector{Float64}, t_cov::Array{Float64, 2})
+                t_mean, t_cov::Array{Float64, 2})
     
     #covariance regularization
     #delta=0.0
@@ -119,7 +123,7 @@ function construct_initial_ensemble(N_ens::Int64, priors; rng_seed=42)
     return params
 end # function construct_initial_ensemble
 
-function compute_error(eki::EKIObj)
+function compute_error(eki)
     meang = dropdims(mean(eki.g[end], dims=1), dims=1)
     diff = eki.g_t - meang 
     X = eki.cov \ diff # diff: column vector
@@ -127,20 +131,33 @@ function compute_error(eki::EKIObj)
     push!(eki.error, newerr)
 end
 
-function run_cloudy_ensemble(kernel:KernelTensor{Float64}, 
-                             dist:CDistributions.Distribution{Float64},
-                             params::Array{Float64, 2}, moments::Array{Float64, 1}, 
-                             config) 
+
+function run_cloudy_ensemble(kernel::KernelTensor{Float64}, 
+                             dist::CDistributions.Distribution{Float64},
+                             params::Array{Float64, 2}, 
+                             moments::Array{Float64, 1}, config) 
     # config: either a tuple defining the time interval over which the 
     # size distribution is stepped forward in time, or a scalar definiing
     # the critical effective radius at which the integration is stopped
-    #TODO: config should be something like *args in python - the idea is to
-    #call  run_cloudy with whatever variables config contains, and multiple
-    #dispatch will then ensure the "right" run_cloudy is executed
-
+    
+    # If dist is a Gamma Distribution, none of the parameters (n, θ, k) 
+    # must be negative. For the time being we just set any negative values
+    # to a small positive value. 
+    # TODO: This is a temporary solution - there are probably better ways to
+    # deal with this. E.g., another option would be to prevent this problem
+    # already when the noise gets added in the EnKI.
+    # Also the parameter check currently only applies to Gamma distributions,
+    # but eventually validity of parameters needs to be ensured for all
+    # distribution types.
+#    if typeof(dist) == CDistributions.Gamma{Float64}
+#        epsilon = 1e-5
+#        params[params.<=0.] .= epsilon
+#    end
     N_ens = size(params, 1) # params is N_ens x N_params
     n_moments = length(moments)
     g_ens = zeros(N_ens, n_moments)
+
+    Random.seed!(42)
 
     for i in 1:N_ens
         # generate the initial distribution
@@ -182,7 +199,7 @@ function run_cloudy(kernel::KernelTensor{Float64},
                     moments::Array{Float64, 1}, re_crit::Float64)
 
     # Numerical parameters
-    tol = 1e-8
+    tol = 1e-7
 
     ######
     ###### ODE: Step moments forward in time
@@ -199,7 +216,7 @@ function run_cloudy(kernel::KernelTensor{Float64},
     # Note: The integration will be stopped when re == re_crit, so tspan[1] is 
     # just an upper bound on the integration time period (ensures termination
     # even if re never equals re_crit)
-    tspan = (0., 100.)
+    tspan = (0., 1000.)
     # Stop condition for ODE solver: re == re_crit
     condition(M, t, integrator) = check_re(M, t, re_crit, dist, integrator)
     affect!(integrator) = terminate!(integrator)
@@ -210,9 +227,14 @@ function run_cloudy(kernel::KernelTensor{Float64},
     prob = ODEProblem(rhs, moments_init, tspan)
 
     # Solve the ODE
-    sol = solve(prob, Tsit5(), reltol=tol, abstol=tol, callback=cb)
-    @assert sol.t[end] < tspan[2]
-    time = sol.t
+    sol = solve(prob, Tsit5(), alg_hints=[:stiff], reltol=tol, abstol=tol, 
+                callback=cb)
+    println("t final:")
+    println(sol.t[end])
+    if !(sol.t[end] < tspan[2])
+        println("Haven't reached re_crit at t=$tspan[2]")
+    end
+    #@assert sol.t[end] < tspan[2]
     # Return moments at last time step
     moments_final = vcat(sol.u'...)[end, :]
     time = sol.t[end]
@@ -236,7 +258,7 @@ function run_cloudy(kernel::KernelTensor{Float64},
                     tspan=Tuple{Float64, Float64})
   
     # Numerical parameters
-    tol = 1e-8
+    tol = 1e-7
 
     ######
     ###### ODE: Step moments forward in time
@@ -253,16 +275,16 @@ function run_cloudy(kernel::KernelTensor{Float64},
     rhs(M, p, t) = get_src_coalescence(M, dist, kernel)
     prob = ODEProblem(rhs, moments_init, tspan)
     # Solve the ODE
-    sol = solve(prob, Tsit5(), reltol=tol, abstol=tol)
+    sol = solve(prob, Tsit5(), alg_hints=[:stiff],reltol=tol, abstol=tol)
     # Return moments at last time step
-    moments_final = vcat(sol.u'...)[end,:]
+    moments_final = vcat(sol.u'...)[end, :]
     time = tspan[2]
         
     return moments_final
 end # function run_cloudy
 
 
-function update_ensemble!(eki::EKIObj, g)
+function update_ensemble!(eki, g)
 
     u = eki.u[end]
 
@@ -293,12 +315,22 @@ function update_ensemble!(eki::EKIObj, g)
     g_bar = g_bar / eki.N_ens
     cov_ug = cov_ug / eki.N_ens - u_bar * g_bar'
     cov_gg = cov_gg / eki.N_ens - g_bar * g_bar'
+
     # update the parameters (with additive noise too)
-    noise = rand(MvNormal(zeros(size(g)[2]), eki.cov), eki.N_ens) #96x100
-    y = (eki.g_t .+ noise)' #add g_t (96) to each column of noise (96x100), then transp. into 100 x 96
+    noise = rand(MvNormal(zeros(size(g)[2]), eki.cov), eki.N_ens) # n_data * n_iter
+#    println("size of noise")
+#    println(size(noise))
+#    println("eki.g_t")
+#    println(eki.g_t)
+#    println("eki.cov")
+#    println(eki.cov)
+    y = (eki.g_t .+ noise)' # add g_t (96) to each column of noise (96x100), then transp. into 100 x 96
     tmp = (cov_gg + eki.cov) \ (y - g)' #96 x 96 \ [100 x 96 - 100 x 96]' = 96 x 100
-    
     u += (cov_ug * tmp)' # 100x2 + [2x96 * 96*100]'
+    println("cov_gg: $cov_gg")
+    println("eki.cov: $(eki.cov)")
+    println("cov_ug: $cov_ug")
+    println("(cov_ug * tmp)': $((cov_ug * tmp)')")
     
     # store new parameters (and observations)
     push!(eki.u, u) # 100 x 2.
@@ -313,7 +345,10 @@ function check_re(M::AbstractArray, t::Float64, re_crit::Float64,
     #update_params!(dist, M)
     #println("time $(integrator.t)")
     #display(plot!(integrator,vars=(0, 3),legend=false))
-    re_crit - CDistributions.moment(dist, 3.0) / CDistributions.moment(dist, 2.0) < 0
+    dist_temp = CDistributions.update_params_from_moments(dist, M)
+    println("check:")
+    println(CDistributions.moment(dist_temp, 1.0)/CDistributions.moment(dist_temp, 2/3))
+    re_crit - CDistributions.moment(dist_temp, 1.0) / CDistributions.moment(dist_temp, 2/3) < 0
 end
 
 end # module EKI

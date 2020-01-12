@@ -1,4 +1,4 @@
-module GPEmulate
+module GPEmulator
 
 """
 Module: GP
@@ -22,16 +22,18 @@ Exports: GPObj
          extract
 -------------------------------------
 """
+# import Cloudy modules
+include("/home/melanie/cloudy/src/PerfectModel/EKI.jl")
+using ..EKI
+include("/home/melanie/cloudy/src/PerfectModel/Truth.jl")
+using ..Truth
 
-#packages
+# packages
 using Statistics 
 using Distributions
 using LinearAlgebra
 using GaussianProcesses
 using ScikitLearn
-include("/home/melanie/cloudy/src/PerfectModel/eki.jl")
-using .EKI
-include("/home/melanie/cloudy/src/PerfectModel/truth.jl")
 
 #@sk_import gaussian_process : GaussianProcessRegressor
 # @sk_import gaussian_process.kernels : (RBF, WhiteKernel, ConstantKernel)
@@ -97,7 +99,7 @@ function GPObj(inputs, data, package)
             #m=GP(inputs,data,mean,kernel,likelihood)
             #inputs param dim x pts in R^2
             #data[i,:] pts x 1 in R
-            mi = GPE(inputs, outputs[i,:], mean, kern, log(sqrt(lognoise)))
+            m = GPE(inputs, outputs[i,:], mean, kern, log(sqrt(lognoise)))
             println(m.kernel)
             set_priors!(m.kernel, priorVec)
             #set_priors!(m.lik,Normal())
@@ -237,13 +239,6 @@ function emulate(u_tp::Array{Float64, 2}, g_tp::Array{Float64, 2},
         optimize_hyperparameters(gpobj)
     end
 
-    #test predictions
-    gtest_pred,gtest_predvar= predict(gpobj,utest)
-    gtest_pred=cat(gtest_pred..., dims=2)
-    err=(gtest-gtest_pred)*yt_covinv*(gtest-gtest_pred)'
-    l2err=sqrt.(sum(sum(err.^2)))
-    println("hparam error in predictions")
-    println(l2err)
 
     #unfortunately can't save GP like this with the sklearn package 
     #as the model is a pointer
@@ -309,7 +304,7 @@ end
 
 function extract(truthobj::TruthObj, ekiobj::EKIObj, N_eki_it::Int64)
     
-    yt = vcat(truthobj.solution.u...)[:, end]
+    yt = vcat(truthobj.solution.u'...)[end,:]
     yt_cov = truthobj.cov
     yt_covinv = inv(yt_cov)
     
@@ -325,4 +320,4 @@ function extract(truthobj::TruthObj, ekiobj::EKIObj, N_eki_it::Int64)
     return yt, yt_cov, yt_covinv, u_tp, g_tp
 end
 
-end #module GPEmulate
+end #module GPEmulator
