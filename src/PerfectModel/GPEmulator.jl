@@ -22,11 +22,9 @@ Exports: GPObj
          extract
 -------------------------------------
 """
-# import Cloudy modules
-include("/home/melanie/cloudy/src/PerfectModel/EKI.jl")
-using ..EKI
-include("/home/melanie/cloudy/src/PerfectModel/Truth.jl")
-using ..Truth
+# import CES modules
+include("EKI.jl")
+include("Truth.jl")
 
 # packages
 using Statistics 
@@ -34,124 +32,93 @@ using Distributions
 using LinearAlgebra
 using GaussianProcesses
 using ScikitLearn
-
-#@sk_import gaussian_process : GaussianProcessRegressor
-# @sk_import gaussian_process.kernels : (RBF, WhiteKernel, ConstantKernel)
-#sk = ScikitLearn
 using Optim
+
+@sk_import gaussian_process : GaussianProcessRegressor
+@sk_import gaussian_process.kernels : (RBF, WhiteKernel, ConstantKernel)
+const sk = ScikitLearn
 #using Interpolations #will use this later (faster)
 #using PyCall
 #py=pyimport("scipy.interpolate")
-#imports
 
-#exports
+# exports
 export GPObj
 export predict
-export optimize_hyperparameters
 export emulate
 export extract
-
 
 #####
 ##### Structure definitions
 #####
+
 #structure to hold inputs/ouputs kernel type and whether we do sparse GP
 struct GPObj
-    inputs::Array{Float64, 2}
-    data::Array{Float64, 2}
+    inputs::Matrix{Float64}
+    data::Matrix{Float64}
     models::Vector
     package::String
 end
 
-#####
-##### Function definitions
-#####
-
 function GPObj(inputs, data, package)
-
     if package == "gp_jl"
-        #Create the GP object(s)
-        #mean:
-        mean = MeanZero()
-        #kernel - lengthscale(squared), variance
-        len2 = ones(size(inputs, 2))
-        var2 = 1.0
-        kern = SEArd(len2,var2)
-        #likelihood
-        #lik=GaussLik(1.0)
-        lognoise = 0.5
-        
-        #regularize with white noise
-        white = Noise(log(2.0))
-        
-        kern = kern + white
-        
         models = Any[]
-        println(size(inputs))
-        println(size(data))
-        flush(stdout)
         outputs = convert(Matrix{Float64}, data')
         inputs = convert(Matrix{Float64}, inputs')
-        
-        #priors
-        priorVec = fill(LogNormal(), length(len2)+1+1)
+
         for i in 1:size(outputs, 1)
-            #m=GP(inputs,data,mean,kernel,likelihood)
-            #inputs param dim x pts in R^2
-            #data[i,:] pts x 1 in R
-            m = GPE(inputs, outputs[i,:], mean, kern, log(sqrt(lognoise)))
-            println(m.kernel)
-            set_priors!(m.kernel, priorVec)
-            #set_priors!(m.lik,Normal())
-            #println(m.kernel.priors)
-            #println(m.lik.priors)
-            flush(stdout)
+            # Zero mean function
+            kmean = MeanZero() 
+            # Construct kernel:
+            # Sum kernel consisting of Matern 5/2 ARD kernel and Squared 
+            # Exponential kernel 
+            len2 = 1.0
+            var2 = 1.0
+            kern1 = SE(len2, var2)
+            kern2 = Matern(5/2, [0.0, 0.0, 0.0], 0.0)
+            lognoise = 0.5
+            # regularize with white noise
+            white = Noise(log(2.0))
+            # construct kernel
+            kern = kern1 + kern2 + white
+
+            # inputs: N_param x N_samples
+            # outputs: N_data x N_samples
+            m = GPE(inputs, outputs[i, :], kmean, kern, sqrt(lognoise))
+            optimize!(m)
             push!(models, m)
-            
         end
         
         GPObj(inputs, outputs, models, package)
         
     elseif package == "sk_jl"
         
-        len2 = ones(size(inputs,2))
+        len2 = ones(size(inputs, 2))
         var2 = 1.0
 
         varkern = ConstantKernel(constant_value=var2,
-                                 constant_value_bounds=(1e-05,10000.0))
-        rbf = RBF(length_scale=len2, length_scale_bounds=(1.0,10000.0))
+                                 constant_value_bounds=(1e-05, 1000.0))
+        rbf = RBF(length_scale=len2, length_scale_bounds=(1.0, 1000.0))
                  
-        white = WhiteKernel(noise_level=1.0, noise_level_bounds=(1e-05,10.0))
+        white = WhiteKernel(noise_level=1.0, noise_level_bounds=(1e-05, 10.0))
         kern = varkern * rbf + white
         models = Any[]
-        
-        #need python style indexing
-        #outputs=[convert(Array{Float64},data[i,:]) for i in size(data,2)]
-        #inputs=[convert(Array{Float64},inputs[i,:]) for i in size(inputs,2)]
-        
+
         outputs = convert(Matrix{Float64}, data')
         inputs = convert(Matrix{Float64}, inputs)
-        println(size(outputs[1,:]))
-        println(size(inputs))
         
         for i in 1:size(outputs,1)
             out = reshape(outputs[i,:], (size(outputs, 2), 1))
             
             m = GaussianProcessRegressor(kernel=kern,
                                          n_restarts_optimizer=10,
-                                         alpha=0.0)
+                                         alpha=0.0, normalize_y=true)
             ScikitLearn.fit!(m, inputs, out)
             if i==1
                 println(m.kernel.hyperparameters)
                 print("Completed training of: ")
             end
             print(i,", ")
-            
-            #println(m.kernel.hyperparameters)
-            flush(stdout)
             push!(models, m)
-            #println(m)
-            #flush(stdout)
         end
 
         GPObj(inputs, outputs, models, package)
@@ -159,45 +126,31 @@ function GPObj(inputs, data, package)
     else 
         println("use package sk_jl or gp_jl")
     end
-end #function GPObj
-
-function optimize_hyperparameters(gp::GPObj)
-    if gp.package == "gp_jl"
-        for i in 1:length(gp.models) 
-            optimize!(gp.models[i])
-            println(gp.models[i].kernel)
-            flush(stdout)
-        end
-    elseif gp.package == "sk_jl"
-        println("optimization already accounted for with fit!")
-        flush(stdout)
-    end
-end #function optimize_hyperparameters
+end # function GPObj
 
 function predict(gp::GPObj, new_inputs::Array{Float64}; 
                  prediction_type="y")
     
-    #predict data (type "y") or latent function (type "f")
-    #column of new_inputs gives new parameter set to evaluate gp at
+    # predict data (type "y") or latent function (type "f")
+    # column of new_inputs gives new parameter set to evaluate gp at
     M = length(gp.models)
     mean = Array{Float64}[]
     var = Array{Float64}[]
-    #predicts columns of inputs so must be transposed
+    # predicts columns of inputs so must be transposed
     if gp.package == "gp_jl"
-        new_inputs = convert(Matrix{Float64},new_inputs')
+        new_inputs = convert(Matrix{Float64}, new_inputs')
     end    
     for i=1:M
         if gp.package == "gp_jl"
             if prediction_type == "y"
-                mu,sig2 = predict_y(gp.models[i],new_inputs)
-                #mu,sig2=predict_y(gp.models[i],new_inputs)
-                push!(mean,mu)
-                push!(var,sig2) 
+                mu, sig2 = predict_y(gp.models[i], new_inputs)
+                push!(mean, mu)
+                push!(var, sig2) 
 
             elseif prediction_type == "f"
-                mu, sig2 = predict_f(gp.models[i],new_inputs')
-                push!(mean,mu)
-                push!(var,sig2) 
+                mu, sig2 = predict_f(gp.models[i], new_inputs')
+                push!(mean, mu)
+                push!(var, sig2) 
 
             else 
                 println("prediction_type must be string: y or f")
@@ -216,91 +169,17 @@ function predict(gp::GPObj, new_inputs::Array{Float64};
 
     return mean, var
 
-end #function predict
+end # function predict
 
 
 function emulate(u_tp::Array{Float64, 2}, g_tp::Array{Float64, 2}, 
                  gppackage::String)
 
-    gpobj=GPObj(u_tp, g_tp, gppackage)#construct the GP based on data
-    if gppackage=="gp_jl"
-        optimize_hyperparameters(gpobj)
-    end
-                 
-    #=
-    #test GP train it on some points and test on others:
-    utrain=u_tp[enssize*6+1:end-2*enssize,:]
-    gtrain=g_tp[enssize*6+1:end-2*enssize,:]
-    utest=u_tp[end-enssize+1:end,:]
-    gtest=g_tp[end-enssize+1:end,:]
-    gpobj=GPObj(utrain,gtrain,gppackage)#construct the GP based on data
-    
-    if gppackage=="gp_jl"
-        optimize_hyperparameters(gpobj)
-    end
+    gpobj = GPObj(u_tp, g_tp, gppackage) # construct the GP based on data
 
-
-    #unfortunately can't save GP like this with the sklearn package 
-    #as the model is a pointer
-    #@save datdir*"gp.jld2" gpobj
-    
-    #plot graph of gp prediction (if using whole domain
-    if dtype == "none"
-        #@ true params need to be pts x params 
-        utrue=[0.7 log(7200)]
-        xplt=truthobj.lats
-        y_pred,y_predvar = predict(gpobj,utrue)
-        y_pred=cat(y_pred...,dims=2)
-        y_predvar=cat(y_predvar...,dims=2)
-        y_predsd=sqrt.(y_predvar)
-        #y_pred=1x96
-        println(size(y_predvar))
-        println(y_predvar)
-        #backend
-        gr()
-        
-        plot(xplt,y_pred[1:nlats],
-             ribbon=(2*y_predsd[1:nlats],2*y_predsd[1:nlats]),
-             legend=false,
-             dpi=300,
-             left_margin=50px,
-             bottom_margin=50px)
-        xlabel!("latitudes")
-        ylabel!("relative humidity")
-        title!("Relative humidity")
-        savefig(outdir*"rhumplot_gp.png")
-        
-        plot(xplt,y_pred[nlats+1:2*nlats],
-             ribbon=(2*y_predsd[nlats+1:2*nlats],2*y_predsd[nlats+1:2*nlats]),             
-             legend=false,
-             dpi=300,
-             left_margin=50px,
-             bottom_margin=50px)
-        xlabel!("latitudes")
-        ylabel!("precipitation")
-        title!("Daily precipitation")
-        savefig(outdir*"precipplot_gp.png")
-        
-        #ylim_min=0.9*minimum(y_pred[2*nlats+1:3*nlats])
-        #ylim_max=1.1*maximum(y_pred[2*nlats+1:3*nlats])
-        
-        
-        plot(xplt,y_pred[2*nlats+1:3*nlats],
-             ribbon=(2*y_predsd[2*nlats+1:3*nlats],2*y_predsd[2*nlats+1:3*nlats]),
-             #ylims = (ylim_min,ylim_max),
-             legend=false,
-             dpi=300,
-             left_margin=50px,
-             bottom_margin=50px)
-        xlabel!("latitudes")
-        ylabel!("probability of extreme precipitation")
-        title!("Extreme precipitation probability")
-        savefig(outdir*"extplot_gp.png")
-    end
-    =#
-              
     return gpobj
 end
+
 
 function extract(truthobj::TruthObj, ekiobj::EKIObj, N_eki_it::Int64)
     
@@ -308,16 +187,16 @@ function extract(truthobj::TruthObj, ekiobj::EKIObj, N_eki_it::Int64)
     yt_cov = truthobj.cov
     yt_covinv = inv(yt_cov)
     
-    #note u[end] does not have an equivalent g
-    u_tp = ekiobj.u[end-N_eki_it:end-1]#it x [enssize x N_param]
-    g_tp = ekiobj.g[end-N_eki_it+1:end]#it x [enssize x N_data]
+    # Note u[end] does not have an equivalent g
+    u_tp = ekiobj.u[end-N_eki_it:end-1] # N_eki_it x [N_ens x N_param]
+    g_tp = ekiobj.g[end-N_eki_it+1:end] # N_eki_it x [N_ens x N_data]
 
-    #u does not require reduction, g does:
-    #g_tp[j] is jth iteration of ensembles 
-    u_tp = cat(u_tp..., dims=1) #[(it x ens) x N_param]
-    g_tp = cat(g_tp..., dims=1) #[(it x ens) x N_data
+    # u does not require reduction, g does:
+    # g_tp[j] is jth iteration of ensembles 
+    u_tp = cat(u_tp..., dims=1) # [(N_eki_it x N_ens) x N_param]
+    g_tp = cat(g_tp..., dims=1) # [(N_eki_it x N_ens) x N_data]
 
     return yt, yt_cov, yt_covinv, u_tp, g_tp
 end
 
-end #module GPEmulator
+end # module GPEmulator

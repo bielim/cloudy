@@ -56,7 +56,6 @@ export sample_posterior!
 #####
 
 # Structure to organize the "truth"
-
 struct TruthObj
     distr_init::CDistributions.Distribution{Float64}
     solution::ODESolution
@@ -64,6 +63,7 @@ struct TruthObj
     cov::Array{Float64, 2}
     data_names::Vector{String}
 end
+
 
 function TruthObj(distr_init::CDistributions.Distribution{Float64}, 
                   solution::ODESolution, cov::Array{Float64, 2},
@@ -865,7 +865,13 @@ function log_prior(mcmc::MCMCObj)
     # a distribution which is potentially a mixture of distributions. 
     priors = mcmc.prior
     for (param, prior_dist) in zip(mcmc.param, priors)
-      log_rho[1] += logpdf(prior_dist, param) # get distrubtion at current parameter values
+      param_std = std(prior_dist)
+      param_mean = mean(prior_dist)
+      # TO DO: This is just a temporary solution - eventually the reverse transformatin to 
+      # get from the z scores to teh original paramter values must not be hard-coded! Need
+      # a way of defining a boolean `standardizing` that specifies whether the MCMC is done
+      # on standardized data or not
+      log_rho[1] += logpdf(prior_dist, param*param_std + param_mean) # get distrubtion at current parameter values
 #        else
 #            println("we have a deterministic distribution")
 #            if param == Deterministic.val
@@ -989,5 +995,40 @@ function sample_posterior!(mcmc::MCMCObj, gpobj::GPObj, max_iter::Int64)
         end
     end
 end # function sample_posterior! 
+
+
+function standardize(X::AbstractVector, mean::AbstractVector, 
+                      std::AbstractVector)
+    for i in 1:length(X)
+        X[i] = (X[i] - mean[i]) / std[i]
+    end
+    return X
+end
+
+function standardize(X::AbstractMatrix, mean::AbstractVector, 
+                      std::AbstractVector)
+    n_cols = size(X)[2]
+    for i in 1:n_cols
+        X[:,i] = (X[:,i] .- mean[i]) ./ std[i]
+    end
+    return X
+end
+
+function reconstruct(X::AbstractVector, mean::AbstractVector, 
+                     std::AbstractVector)
+    for i in 1:length(X)
+      X[i] = X[i] .* std[i] .+ mean[i]
+    end
+    return X
+end
+
+function reconstruct(X::AbstractMatrix, mean::AbstractVector, 
+                     std::AbstractVector)
+    n_cols = size(X)[2]
+    for i in 1:n_cols
+        X[:,i] = X[:,i] .* std[i] .+ mean[i]
+    end
+    return X
+end
 
 end # module CES

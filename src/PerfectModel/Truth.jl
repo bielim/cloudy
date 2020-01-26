@@ -2,15 +2,10 @@ module Truth
 
 # Import Cloudy modules
 using Cloudy.KernelTensors
-using Cloudy.CDistributions
+using Cloudy.Distributions
 using Cloudy.Sources
 
 # packages
-using JLD2 # saving and loading Julia arrays
-using Distributions  # probability distributions and associated functions
-using DelimitedFiles 
-using Sundials
-using StatsBase
 using LinearAlgebra
 using DifferentialEquations
 
@@ -23,56 +18,62 @@ export run_cloudy_truth
 #####
 
 # Structure to organize the "truth"
-
 struct TruthObj
-    distr_init::CDistributions.Distribution{Float64}
-    solution::ODESolution
-    yt::Array{Float64, 1}
-    cov::Array{Float64, 2}
-    data_names::Vector{String}
+    distr_init::Distribution{Float64}
+    solution::ODESolution # full solution of Cloudy run
+    y_t::Array{Float64, 1} # true data (="observations")
+    cov::Array{Float64, 2} # covariance of the obs noise
+    data_names::Vector{String} 
 end
 
-function TruthObj(distr_init::CDistributions.Distribution{Float64}, 
+# Constructors
+function TruthObj(distr_init::Distribution{Float64}, 
                   solution::ODESolution, cov::Array{Float64, 2},
                   data_names::Vector{String})
 
-    yt = vcat(solution.u'...)[end, :]
+    y_t = vcat(solution.u'...)[end, :]
 
-    TruthObj(distr_init, solution, yt, cov, data_names)
-
-end
-
-#####
-##### Functions definitions
-#####
-
-function check_re(M::Array{Float64, 1}, t::Float64, re_crit::Float64,
-                  dist::CDistributions.Distribution{Float64})
-    dist_temp = CDistributions.update_params_from_moments(dist, M)
-    re_crit - CDistributions.moment(dist_temp, 1.0) / CDistributions.moment(dist_temp, 2.0/3.0) < 0
+    TruthObj(distr_init, solution, y_t, cov, data_names)
 end
 
 
+#####
+##### Function definitions
+#####
+
+"""
+function run_cloudy_truth(kernel, dist, moments, tspan, data_names, obs_noise)
+
+- `kernel` - Cloudy KernelTensor defining particle interactions
+- `dist` - Cloudy.Distribution defining the intial particle mass distirbution
+- `moments` - Moments of dist to collect in Cloudy as they evolve over time,
+              e.g. [0.0, 1.0, 2.0] for the 0th, 1st and 2nd moment
+- `tspan` - Time period over which Cloudy is run, e.g. (0.0, 1.0)
+- `data_names` - Names of the data/moments to collect, e.g. ["M0", "M1", "M2"]
+- `obs_noise` - Covariance of the observational noise (assumed to be normally
+                distributed with mean zero). Will be used as an attribute of 
+                the returned TruthObj. If obs_noise is Nothing, it will be 
+                defined within run_cloudy_truth based on draws from a normal
+                distribution with mean 0 and standard deviation 2.
+
+Returns a TruthObj.
+"""
 function run_cloudy_truth(kernel::KernelTensor{Float64}, 
-                          dist::CDistributions.Distribution{Float64}, 
+                          dist::Distribution{Float64}, 
                           moments::Array{Float64}, 
                           tspan::Tuple{Float64, Float64}, 
-                          data_names::Vector{String})
-
+                          data_names::Vector{String},
+                          obs_noise::Union{Array{Float64, 2}, Nothing};
+                          rng_seed=42)
     # Numerical parameters
     tol = 1e-7
-
-    ##
-    ## ODE: Step moments forward in time
-    ##
 
     # moments_init is the initial condition for the ODE problem
     n_moments = length(moments)
     moments_init = fill(NaN, length(moments))
     for (i, mom) in enumerate(moments)
-        moments_init[i] = CDistributions.moment(dist, convert(Float64, mom))
+        moments_init[i] = Distributions.moment(dist, convert(Float64, mom))
     end
-    #println(moments_init)
 
     # Set up ODE problem: dM/dt = f(M,p,t)
     rhs(M, p, t) = get_src_coalescence(M, dist, kernel)
@@ -80,67 +81,14 @@ function run_cloudy_truth(kernel::KernelTensor{Float64},
 
     # Solve the ODE
     sol = solve(prob, CVODE_BDF(), reltol=tol, abstol=tol, save_everystep=true)
-    solcov = 0.1^2*Diagonal(diag(cov(vcat(sol.u'...))))
-    solcov = convert(Array, solcov)
-    # Here we are artificially turning the value of 0 for the variance of the first 
-    # moment (a result of mass conservation) into a small value epsilon. Otherwise
-    # the matrix is singular, and attempts to invert it will result in errors
-    eps = 0.1
-    solcov[2,2] = eps
-    println(typeof(solcov))  
-    # TO DO: Find a way to estimate a reasonable covariance structure of 
-    # the noise
-    #A = rand(Distributions.Uniform(-2.0, 2.0), n_moments, n_moments) 
-    #cov = A * A'
-    solmean = vec(mean(vcat(sol.u'...), dims=1))
-    #solcov = Diagonal(A * A')
-    #solcov = 0.1^2 * Matrix{Float64}(I, n_moments, n_moments)
 
-    return TruthObj(dist, sol, solcov, data_names)
+    if obs_noise isa Nothing
+        # Define observational noise
+        Random.seed!(rng_seed)
+        A = rand(Distributions.Normal(0, 2.0), n_moments, n_moments)
+        obs_noise = A * A'
+
+    return TruthObj(dist, sol, obs_noise, data_names)
 end
-
-
-function run_cloudy_truth(kernel::KernelTensor{Float64}, 
-                          dist::CDistributions.Distribution{Float64}, 
-                          moments::Array{Float64, 1}, re_crit::Float64,
-                          data_names::Vector{String})
-
-    # Numerical parameters
-    tol = 1e-7
-
-    ##
-    ## ODE: Step moments forward in time
-    ##
-
-    # moments_init is the initial condition for the ODE problem
-    n_moments = length(moments)
-    moments_init = fill(NaN, length(moments))
-    for (i, mom) in enumerate(moments)
-        moments_init[i] = CDistributions.moment(dist, convert(Float64, mom))
-    end
-    #println(moments_init)
-
-    tspan = (0., 100.)
-    condition(M, t, integrator) = check_re(M, t, re_crit, dist)
-    affect!(integrator) = terminate!(integrator)
-    cb = DiscreteCallback(condition, affect!)
-
-    # Set up ODE problem: dM/dt = f(M,p,t)
-    rhs(M, p, t) = get_src_coalescence(M, dist, kernel)
-    prob = ODEProblem(rhs, moments_init, tspan)
-
-    # Solve the ODE
-    sol = solve(prob, CVODE_BDF(), reltol=tol, abstol=tol, callback=cb)
-    solcov = cov(vcat(sol.u'...))
-    # TO DO: Find a way to estimate a reasonable covariance structure of 
-    # the noise
-   # A = rand(Distributions.Uniform(-5.0, 5.0), n_moments, n_moments) 
-    #cov = Diagonal(A * A')
-
-    solmean = vec(mean(vcat(sol.u'...), dims=1))
-
-    return TruthObj(dist, sol, solmean, solcov, data_names)
-end
-
 
 end # module Truth

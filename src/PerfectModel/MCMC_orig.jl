@@ -21,9 +21,9 @@ Exports: MCMCObj
 -------------------------------------
 """
 # import Cloudy modules
-include("EKI.jl")
-include("Truth.jl")
-include("GPEmulator.jl")
+include("/home/melanie/cloudy/src/PerfectModel/EKI.jl")
+include("/home/melanie/cloudy/src/PerfectModel/Truth.jl")
+include("/home/melanie/cloudy/src/PerfectModel/GPEmulator.jl")
 using .GPEmulator
 
 # packages
@@ -60,7 +60,6 @@ struct MCMCObj
     iter::Array{Int64}
     accept::Array{Int64}
     algtype::String
-    standardized::Bool
 end
 
 
@@ -71,12 +70,11 @@ end
 #outer constructors
 function MCMCObj(truth_sample::Vector{Float64}, truth_cov::Array{Float64, 2}, 
                  priors::Array, step::Float64, param_init::Vector{Float64}, 
-                 max_iter::Int64, algtype::String, burnin::Int64, 
-                 standardized::Bool)
+                 max_iter::Int64, algtype::String, burnin::Int64)
     
-    # first row is param_init 
+    #first row is param_init 
     posterior = zeros(max_iter + 1, length(param_init))
-    posterior[1, :] = param_init
+    posterior[1,:] = param_init
     param = param_init
     log_posterior = [nothing]
     iter = [1]
@@ -87,23 +85,23 @@ function MCMCObj(truth_sample::Vector{Float64}, truth_cov::Array{Float64, 2},
         sys.exit()
     end
     MCMCObj(truth_sample, truth_cov, truth_covinv, priors, [step], burnin, 
-            param, posterior, log_posterior, iter, accept, algtype,
-            standardized)
+            param, posterior, log_posterior, iter, accept, algtype)
 
 end
 
 function reset_with_step!(mcmc::MCMCObj, step::Float64)
-    # reset to beginning with new stepsize
+    #reset to beginning with new stepsize
     mcmc.step[1] = step
     mcmc.log_posterior[1] = nothing
     mcmc.iter[1] = 1
     mcmc.accept[1] = 0
     mcmc.posterior[2:end, :] = zeros(size(mcmc.posterior[2:end, :]))
     mcmc.param[:] = mcmc.posterior[1, :]
+    println(mcmc.param)
 end
 
 
-# exported functions
+#exported functions
 function get_posterior(mcmc::MCMCObj)
     return mcmc.posterior[mcmc.burnin+1:end, :]
 end
@@ -116,19 +114,16 @@ function mcmc_sample!(mcmc::MCMCObj, g::Vector{Float64}, gvar::Vector{Float64})
     if mcmc.log_posterior[1] isa Nothing #do an accept step.
         mcmc.log_posterior[1] = log_posterior - log(0.5) #this makes p_accept = 0.5
     end    
+    #else
     p_accept = exp(log_posterior - mcmc.log_posterior[1])
-
-    if p_accept > rand(Distributions.Uniform(0, 1))
-        mcmc.posterior[1 + mcmc.iter[1], :] = mcmc.param
+    if p_accept>rand(Uniform(0, 1))
+        mcmc.posterior[1 + mcmc.iter[1],:] = mcmc.param
         mcmc.log_posterior[1] = log_posterior
         mcmc.accept[1] = mcmc.accept[1] + 1
     else 
-        mcmc.posterior[1 + mcmc.iter[1], :] = mcmc.posterior[mcmc.iter[1], :]
+        mcmc.posterior[1+mcmc.iter[1], :] = mcmc.posterior[mcmc.iter[1], :]
     end
-    # get new parameters by comparing likelihood_current * prior_current to
-    # likelihood_proposal * prior_proposal - either we accept the proposed
-    # parameter or we stay where we are.
-    mcmc.param[:] = proposal(mcmc)[:] 
+    mcmc.param[:] = proposal(mcmc)[:]#performed by sampling about posterior[1+mcmc.iter[1],:]
     mcmc.iter[1] = mcmc.iter[1] + 1
   
 end # function mcmc_sample!
@@ -140,17 +135,20 @@ end
 
 function log_likelihood(mcmc::MCMCObj, g::Vector{Float64}, 
                         gvar::Vector{Float64})
+    #we either use the true covariance (if we have an evaluation of true model)
+    #or we use a supplied covariance (if we say have a supplied GP 
+    #mean/covariance)
     log_rho = [0.0]
     if gvar == nothing
         diff = g - mcmc.truth_sample
         log_rho[1] = -0.5 * diff' * mcmc.truth_covinv * diff
     else
-      total_cov = Diagonal(gvar) .+ mcmc.truth_cov
-      total_cov = mcmc.truth_cov
-      total_cov_inv = inv(total_cov)
-      diff = g - mcmc.truth_sample
-      log_rho[1] = -0.5 * diff' * total_cov_inv * diff - 0.5 * log(det(total_cov))
+        gcov_inv = Diagonal(1.0 ./ gvar)
+        log_gpfidelity = -0.5*sum(log.(gvar))
+        diff = g-mcmc.truth_sample
+        log_rho[1] = -0.5 * diff' * gcov_inv * diff + log_gpfidelity
     end
+
     return log_rho[1]
 end
 
@@ -158,14 +156,19 @@ end
 function log_prior(mcmc::MCMCObj)
     log_rho = [0.0]
     # Assume independent priors for each parameter
-    priors = mcmc.prior
+    # TODO: This currently doesn't work for Mixture ditributions yet. priors = mcmc.prior[1]
+    # extracts the priors of all parameters that define the first (primitive) components of
+    # a distribution which is potentially a mixture of distributions. 
+    priors = mcmc.prior[1] 
     for (param, prior_dist) in zip(mcmc.param, priors)
-        if mcmc.standardized
-            param_std = std(prior_dist)
-            param_mean = mean(prior_dist)
-            log_rho[1] += logpdf(prior_dist, param*param_std + param_mean) # get density at current parameter value
+        if !(typeof(prior_dist) == Deterministic{Float64})
+            log_rho[1] += logpdf(prior_dist, param) # get distrubtion at current parameter values
         else
-            log_rho[1] += logpdf(prior_dist, param) # get density at current parameter value
+            if param == Deterministic.val
+                log_rho[1] += 0.
+            else
+              log_rho[1] -= 100_000.
+            end
         end
     end
 
@@ -174,22 +177,28 @@ end
 
 
 function proposal(mcmc::MCMCObj)
-
-    variances = ones(length(mcmc.param))
-#    for (idx, prior) in enumerate(mcmc.prior)
-#        variances[idx] = var(prior)
-#    end
+    var = zeros(length(mcmc.param))
+    unidx = zeros(length(mcmc.prior))
+    # TODO: Similar to log_prior, this currently doesn't work for mixture 
+    # distributions
+    priors = mcmc.prior[1]
+    for (idx, prior) in enumerate(priors)
+        var[idx] = var(prior)
+        if typeof(prior) == Uniform{Float64}
+            unidx[idx] = 1
+        end
+    end
 
     if mcmc.algtype == "rwm"
-        #prop_dist = MvNormal(mcmc.posterior[1 + mcmc.iter[1], :], (mcmc.step[1]) * Diagonal(variances))
-        prop_dist = MvNormal(zeros(length(mcmc.param)), (mcmc.step[1]^2) * Diagonal(variances))
+        prop_dist = MvNormal(mcmc.posterior[1 + mcmc.iter[1],:], (mcmc.step[1]^2) * Diagonal(var))
     end
-    sample = mcmc.posterior[1 + mcmc.iter[1], :] .+ rand(prop_dist)
+    sample = rand(prop_dist)
 
     for (idx, prior) in enumerate(mcmc.prior)
-        while !insupport(prior, sample[idx])
-            println("not in support - resampling")
-            sample[:] = mcmc.posterior[1 + mcmc.iter[1], :] .+ rand(prop_dist)
+        if unidx[idx] > 0
+            while sample[idx] < prior.a || sample[idx] > prior.b
+                sample[:] = rand(prop_dist)
+            end
         end
     end
             
@@ -211,12 +220,12 @@ function find_mcmc_step!(mcmc_test::MCMCObj, gpobj::GPObj)
     while mcmc_accept == false 
         
         param = convert(Array{Float64, 2}, mcmc_test.param')
-        # test predictions param' is 1xN_params
+        #test predictions param' is 1x2
         gp_pred, gp_predvar = predict(gpobj, param)
         gp_pred = cat(gp_pred..., dims=2)
         gp_predvar = cat(gp_predvar..., dims=2)
         
-        mcmc_sample!(mcmc_test, vec(gp_pred), vec(gp_predvar))
+        mcmc_sample(mcmc_test, vec(gp_pred), vec(gp_predvar))
         it += 1
         if it % 2000 == 0
             countmcmc += 1
@@ -265,14 +274,14 @@ function sample_posterior!(mcmc::MCMCObj, gpobj::GPObj, max_iter::Int64)
    
     for mcmcit in 1:max_iter
         param = convert(Array{Float64, 2}, mcmc.param')
-        #test predictions param' is 1xN_params
-        gp_pred, gp_predvar = predict(gpobj, param)
-        gp_pred = cat(gp_pred..., dims=2)
-        gp_predvar = cat(gp_predvar..., dims=2)
+        #test predictions param' is 1x2
+        gp_pred,gp_predvar = predict(gpobj, param)
+        gp_pred=cat(gp_pred..., dims=2)
+        gp_predvar=cat(gp_predvar..., dims=2)
         
-        mcmc_sample!(mcmc, vec(gp_pred), vec(gp_predvar))
+        mcmc_sample(mcmc, vec(gp_pred), vec(gp_predvar))
    
-        if mcmcit % 1000 == 0
+        if mcmcit % 10000 == 0
             acc_ratio = accept_ratio(mcmc)
             println("iteration ", mcmcit ," of ", max_iter, 
                     "; acceptance rate = ", acc_ratio, 
@@ -281,48 +290,5 @@ function sample_posterior!(mcmc::MCMCObj, gpobj::GPObj, max_iter::Int64)
         end
     end
 end # function sample_posterior! 
-
-
-function orig2zscore(X::AbstractVector, mean::AbstractVector, 
-                      std::AbstractVector)
-    # Compute the z scores of a vector X using the given mean 
-    # and std
-    for i in 1:length(X)
-        X[i] = (X[i] - mean[i]) / std[i]
-    end
-    return X
-end
-
-function orig2zscore(X::AbstractMatrix, mean::AbstractVector, 
-                      std::AbstractVector)
-    # Compute the z scores of matrix X using the given mean and
-    # std. Transformation is applied column-wise.
-    n_cols = size(X)[2]
-    for i in 1:n_cols
-        X[:,i] = (X[:,i] .- mean[i]) ./ std[i]
-    end
-    return X
-end
-
-function zscore2orig(X::AbstractVector, mean::AbstractVector, 
-                     std::AbstractVector)
-    # Transform X (a vector of z scores) back to the original 
-    # values
-    for i in 1:length(X)
-      X[i] = X[i] .* std[i] .+ mean[i]
-    end
-    return X
-end
-
-function reconstruct(X::AbstractMatrix, mean::AbstractVector, 
-                     std::AbstractVector)
-    # Transform X (a matrix of z scores) back to the original
-    # values. Transformation is applied column-wise.
-    n_cols = size(X)[2]
-    for i in 1:n_cols
-        X[:,i] = X[:,i] .* std[i] .+ mean[i]
-    end
-    return X
-end
 
 end # module MCMC
